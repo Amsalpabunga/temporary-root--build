@@ -1,0 +1,214 @@
+diff -ruN trorig/Temporary-Root-master/CHANGELOG.md trsrc/Temporary-Root-master/CHANGELOG.md
+--- trorig/Temporary-Root-master/CHANGELOG.md	2026-11-01 07:03:55.000000000 +0000
++++ trsrc/Temporary-Root-master/CHANGELOG.md	2026-11-06 06:49:01.803273154 +0000
+@@ -1,3 +1,10 @@
++## 2.1.1 - SukiSU randomized ksud payload detection
++
++- Keep support for legacy `libksud.so` and `ksud` filenames.
++- Detect a single randomized native-library payload only when it is larger than 1 MiB and validates as an ELF64 little-endian AArch64 PIE with a non-zero entry point and executable load segment.
++- Use the same resolver for manager-list detection and payload staging; ambiguous candidates are rejected.
++- DirtyFrag and GhostLock exploit implementations are unchanged.
++
+ # Changelog
+ 
+ All notable changes to Temporary Root.
+diff -ruN trorig/Temporary-Root-master/app/build.gradle.kts trsrc/Temporary-Root-master/app/build.gradle.kts
+--- trorig/Temporary-Root-master/app/build.gradle.kts	2026-11-01 07:03:55.000000000 +0000
++++ trsrc/Temporary-Root-master/app/build.gradle.kts	2026-11-06 06:49:14.130587172 +0000
+@@ -20,8 +20,8 @@
+         applicationId = "build.bytes.temproot"
+         minSdk = 32
+         targetSdk = 37
+-        versionCode = 6
+-        versionName = "2.1"
++        versionCode = 7
++        versionName = "2.1.1"
+ 
+         ndk {
+             abiFilters += listOf("arm64-v8a")
+diff -ruN trorig/Temporary-Root-master/app/src/main/java/build/bytes/temproot/ExploitRunner.java trsrc/Temporary-Root-master/app/src/main/java/build/bytes/temproot/ExploitRunner.java
+--- trorig/Temporary-Root-master/app/src/main/java/build/bytes/temproot/ExploitRunner.java	2026-11-01 07:03:55.000000000 +0000
++++ trsrc/Temporary-Root-master/app/src/main/java/build/bytes/temproot/ExploitRunner.java	2026-11-06 06:49:14.130063773 +0000
+@@ -12,6 +12,7 @@
+ import java.io.BufferedReader;
+ import java.io.File;
+ import java.io.IOException;
++import java.io.RandomAccessFile;
+ import java.io.InputStreamReader;
+ import java.nio.file.Files;
+ import java.nio.file.StandardCopyOption;
+@@ -29,11 +30,98 @@
+     static final String PREF_OPEN_MANAGER = "open_manager_after_success";
+     private static final String NATIVE_BIN    = "libtemproot.so";
+ 
++    private static final long MIN_RANDOM_KSUD_SIZE = 1024L * 1024L;
++
++    /**
++     * Resolve the manager's ksud payload.
++     *
++     * Legacy managers keep their stable names. Newer SukiSU builds may package
++     * the PIE executable under a generated .so name; for those, accept only a
++     * single >1 MiB ELF64 little-endian AArch64 ET_DYN file with a non-zero
++     * entry point and an executable PT_LOAD segment. Ambiguous directories fail
++     * closed instead of selecting an arbitrary large native library.
++     */
++    static File findKsud(ApplicationInfo app) {
++        if (app == null || app.nativeLibraryDir == null) return null;
++        File dir = new File(app.nativeLibraryDir);
++
++        // Preserve compatibility with managers that use the documented names.
++        File named = new File(dir, "libksud.so");
++        if (isReadableFile(named)) return named;
++        named = new File(dir, "ksud");
++        if (isReadableFile(named)) return named;
++
++        File[] files = dir.listFiles();
++        if (files == null) return null;
++        List<File> candidates = new ArrayList<>();
++        for (File file : files) {
++            if (!file.getName().endsWith(".so")
++                    || !isReadableFile(file)
++                    || file.length() <= MIN_RANDOM_KSUD_SIZE) {
++                continue;
++            }
++            if (isAarch64PieExecutable(file)) candidates.add(file);
++        }
++        return candidates.size() == 1 ? candidates.get(0) : null;
++    }
++
+     static boolean hasKsud(ApplicationInfo app) {
+-        if (app.nativeLibraryDir == null) return false;
+-        // Forked managers name the daemon differently (libksud.so vs ksud).
+-        return new File(app.nativeLibraryDir, "libksud.so").exists()
+-                || new File(app.nativeLibraryDir, "ksud").exists();
++        return findKsud(app) != null;
++    }
++
++    private static boolean isReadableFile(File file) {
++        return file.isFile() && file.canRead() && file.length() > 0;
++    }
++
++    private static int u16le(byte[] b, int off) {
++        return (b[off] & 0xff) | ((b[off + 1] & 0xff) << 8);
++    }
++
++    private static long u32le(byte[] b, int off) {
++        return ((long) b[off] & 0xff)
++                | (((long) b[off + 1] & 0xff) << 8)
++                | (((long) b[off + 2] & 0xff) << 16)
++                | (((long) b[off + 3] & 0xff) << 24);
++    }
++
++    private static long u64le(byte[] b, int off) {
++        return u32le(b, off) | (u32le(b, off + 4) << 32);
++    }
++
++    private static boolean isAarch64PieExecutable(File file) {
++        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
++            if (raf.length() < 64) return false;
++            byte[] header = new byte[64];
++            raf.readFully(header);
++            if (header[0] != 0x7f || header[1] != 'E'
++                    || header[2] != 'L' || header[3] != 'F') return false;
++            if ((header[4] & 0xff) != 2 || (header[5] & 0xff) != 1) return false;
++            if (u16le(header, 16) != 3 || u16le(header, 18) != 183) return false;
++            if (u64le(header, 24) == 0) return false;
++
++            long phoff = u64le(header, 32);
++            int phentsize = u16le(header, 54);
++            int phnum = u16le(header, 56);
++            if (phoff < 64 || phentsize < 56 || phnum == 0 || phnum > 256
++                    || phoff + (long) phentsize * phnum > raf.length()) return false;
++
++            byte[] phdr = new byte[phentsize];
++            boolean executableLoadSegment = false;
++            for (int i = 0; i < phnum; i++) {
++                raf.seek(phoff + (long) i * phentsize);
++                raf.readFully(phdr);
++                long type = u32le(phdr, 0);
++                long flags = u32le(phdr, 4);
++                // PT_LOAD with PF_X: proves this PIE contains executable code.
++                if (type == 1 && (flags & 1) != 0) {
++                    executableLoadSegment = true;
++                    break;
++                }
++            }
++            return executableLoadSegment;
++        } catch (IOException | RuntimeException ignored) {
++            return false;
++        }
+     }
+ 
+     static ApplicationInfo resolveManager(Context ctx, String packageName) {
+@@ -63,11 +151,15 @@
+             reporter.report(suManagerPackage + " is no longer installed\n");
+             return 2;
+         }
+-        if (!hasKsud(app)) {
+-            reporter.report("libksud.so not found in " + suManagerPackage + "\n");
++        File ksud = findKsud(app);
++        if (ksud == null) {
++            reporter.report("No compatible ksud payload found in " + suManagerPackage
++                    + " (expected libksud.so/ksud, or one unambiguous >1 MiB AArch64 PIE .so)\n");
+             return 2;
+         }
+-        stageAssets(ctx, suManagerPackage);
++        reporter.report("ksud payload selected: " + ksud.getName()
++                + " (" + ksud.length() + " bytes)\n");
++        stageAssets(ctx, ksud);
+ 
+         EspSession session = EspSession.open(ctx);
+         try {
+@@ -175,11 +267,10 @@
+             throw new IOException("setExecutable failed: " + dest.getAbsolutePath());
+     }
+ 
+-    private static void stageAssets(Context ctx, String suManagerPackage) throws Exception {
+-        var app = ctx.getPackageManager().getApplicationInfo(suManagerPackage, 0);
+-        File ksud = new File(app.nativeLibraryDir, "libksud.so");
+-        if (!ksud.exists()) ksud = new File(app.nativeLibraryDir, "ksud");
+-        stageBin(ctx, ksud, "ksud"); // stage for a predictable path
++    private static void stageAssets(Context ctx, File ksud) throws Exception {
++        if (ksud == null || !isReadableFile(ksud))
++            throw new IOException("Resolved ksud payload is no longer readable");
++        stageBin(ctx, ksud, "ksud"); // stable path expected by bootstrap.c
+         stageBin(ctx, new File(ctx.getApplicationInfo().nativeLibraryDir, "libbootstrap.so"), "bootstrap");
+     }
+ 
+diff -ruN trorig/Temporary-Root-master/app/src/main/java/build/bytes/temproot/MainActivity.java trsrc/Temporary-Root-master/app/src/main/java/build/bytes/temproot/MainActivity.java
+--- trorig/Temporary-Root-master/app/src/main/java/build/bytes/temproot/MainActivity.java	2026-11-01 07:03:55.000000000 +0000
++++ trsrc/Temporary-Root-master/app/src/main/java/build/bytes/temproot/MainActivity.java	2026-11-06 06:49:14.130508443 +0000
+@@ -511,8 +511,9 @@
+         boolean hasDownload = selectedEntry != null && (selectedEntry.githubRepo != null || selectedEntry.fallbackWebUrl != null);
+         boolean isActive = isRootActive();
+ 
+-        boolean dotOk = isActive || Boolean.TRUE.equals(deviceOk) || (deviceOk == null && isInstalled);
+-        boolean canRun = isInstalled && (deviceOk == null || deviceOk);
++        boolean hasPayload = selectedEntry != null && selectedEntry.hasKsud;
++        boolean dotOk = isActive || Boolean.TRUE.equals(deviceOk) || (deviceOk == null && isInstalled && hasPayload);
++        boolean canRun = isInstalled && hasPayload && (deviceOk == null || deviceOk);
+         btnOpenManager.setEnabled(isInstalled);
+         btnDownloadManager.setEnabled(hasDownload);
+         if (statusDot != null) {
+@@ -530,10 +531,10 @@
+             if (deviceOk != null) return;
+             if (selectedEntry == null) {
+                 statusView.setText("Pick a root manager to continue");
++            } else if (isInstalled && !selectedEntry.hasKsud) {
++                statusView.setText(selectedEntry.title + " is installed but has no compatible ksud payload");
+             } else if (isInstalled) {
+                 statusView.setText("Ready • " + selectedEntry.title);
+-            } else if (selectedEntry.isInstalled && !selectedEntry.hasKsud) {
+-                statusView.setText(selectedEntry.title + " is installed but has no libksud.so — reinstall it");
+             } else {
+                 statusView.setText(selectedEntry.title + " is not installed. Tap Download to get the APK.");
+             }
+@@ -1098,7 +1099,7 @@
+             bindIcon(v, item);
+ 
+             if (item.isInstalled) {
+-                packageView.setText("Package: " + item.installedPackageName + (item.hasKsud ? "" : " (no libksud.so)"));
++                packageView.setText("Package: " + item.installedPackageName + (item.hasKsud ? "" : " (no compatible ksud payload)"));
+                 badgeView.setText(item.hasKsud ? "INSTALLED" : "MISSING KSUD");
+                 badgeView.setTextColor(context.getColor(item.hasKsud ? R.color.badge_ok_text : R.color.badge_bad_text));
+                 badgeView.setBackground(createBadgeBackground(item.hasKsud ? R.color.badge_ok_bg : R.color.badge_bad_bg));
