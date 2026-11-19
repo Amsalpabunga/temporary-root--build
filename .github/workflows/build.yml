@@ -1,95 +1,62 @@
 
-name: Build Temporary Root
+name: Build Temporary Root APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
 
 jobs:
-  build-lkms:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        kmi:
-          - android12-5.10
-          - android13-5.10
-          - android13-5.15
-          - android14-5.15
-          - android14-6.1
-          - android15-6.6
-          - android16-6.12
-          - android17-6.18
-
-    container:
-      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-20260828
-      options: --privileged
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract source
-        run: |
-          mkdir -p source
-          ZIP=$(find . -maxdepth 1 -name '*patched*source*.zip' | head -n 1)
-          test -n "$ZIP"
-          unzip -q "$ZIP" -d source
-          echo "SRC=$GITHUB_WORKSPACE/source/Temporary-Root-master" >> "$GITHUB_ENV"
-
-      - name: Build kernel module
-        run: |
-          cd "$SRC/lkm"
-          make -j$(nproc)
-          llvm-objcopy --strip-unneeded \
-            -R .comment -R .note.gnu.build-id -R .note.gnu.property \
-            -R .note.Linux -R .note.GNU-stack \
-            -R .BTF -R .BTF.base -R .llvm_addrsig \
-            -R .hyp.text -R .hyp.bss -R .hyp.rodata \
-            -R .hyp.event_ids -R .hyp.patchable_function_entries \
-            -R .hyp.data temproot.ko
-          mkdir -p "$GITHUB_WORKSPACE/out"
-          cp temproot.ko "$GITHUB_WORKSPACE/out/temproot-${{ matrix.kmi }}.ko"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: temproot-lkm-${{ matrix.kmi }}
-          path: out/temproot-${{ matrix.kmi }}.ko
-
-  build-apk:
-    needs: build-lkms
+  build:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Extract source
+      - name: Extract patched source
         run: |
           mkdir -p source
           ZIP=$(find . -maxdepth 1 -name '*patched*source*.zip' | head -n 1)
-          test -n "$ZIP"
+
+          if [ -z "$ZIP" ]; then
+            echo "Patched source ZIP tidak ditemukan"
+            exit 1
+          fi
+
           unzip -q "$ZIP" -d source
-          echo "SRC=$GITHUB_WORKSPACE/source/Temporary-Root-master" >> "$GITHUB_ENV"
 
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: temproot-lkm-*
-          merge-multiple: true
-          path: source/Temporary-Root-master/app/src/main/jni/ko/
+          SRC=$(find source -name gradlew -type f | head -n 1)
 
-      - uses: actions/setup-java@v4
+          if [ -z "$SRC" ]; then
+            echo "gradlew tidak ditemukan"
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$(dirname "$SRC")" >> "$GITHUB_ENV"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '17'
+
+      - name: Install Android build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip zip cmake ninja-build
 
       - name: Build APK
         run: |
-          cd "$SRC"
+          cd "$PROJECT_DIR"
           chmod +x gradlew
-          ./gradlew :app:assembleDebug
+          ./gradlew assembleDebug --stacktrace
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          name: TemporaryRoot-debug
-          path: source/Temporary-Root-master/app/build/outputs/apk/debug/*.apk
+          name: TemporaryRoot-debug-APK
+          path: '**/build/outputs/apk/debug/*.apk'
+          if-no-files-found: error
           
