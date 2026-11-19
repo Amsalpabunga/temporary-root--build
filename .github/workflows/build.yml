@@ -12,17 +12,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Extract source ZIP
+        run: |
+          mkdir -p source
+          unzip -o TemporaryRoot_SukiSU_r2_patched_source.zip -d source
 
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+      - name: Locate Gradle project
+        run: |
+          find source -name gradlew -type f
 
       - name: Build APK
         run: |
+          GRADLEW=$(find source -name gradlew -type f | head -n 1)
+          if [ -z "$GRADLEW" ]; then
+            echo "ERROR: gradlew tidak ditemukan dalam source ZIP"
+            exit 1
+          fi
+          cd "$(dirname "$GRADLEW")"
           chmod +x gradlew
           ./gradlew assembleDebug
 
@@ -30,5 +36,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: TemporaryRoot-APK
-          path: '**/build/outputs/apk/**/*.apk'
-          
+          path: source/**/build/outputs/apk/**/*.apk
+          if-no-files-found: error
